@@ -167,6 +167,118 @@ Use [`$$nemoclaw <name> destroy`](../../reference/commands#$$nemoclaw-name-destr
 
 <AgentOnly variant="openclaw">
 
+## Run an OpenClaw Task from a Shell Script
+
+Use NemoClaw from a host Bash script to send a task file to an existing, running OpenClaw sandbox.
+The sandbox must report `Ready` or `Running`, and `openshell` must be available on the host's `PATH`.
+Use a valid agent selector; the example uses `--agent main`.
+To find available agents, run `openclaw agents list` inside the sandbox.
+
+<Warning>
+The task runs inside the sandbox and can use its configured inference provider and tools, including tools that change resources.
+Running a local script does not mean offline inference or OpenClaw `--local` mode.
+Send only task data appropriate for those configured destinations.
+Raw results, diagnostics, and session transcripts can contain sensitive task data.
+Keep them private and review them before sharing.
+</Warning>
+
+### Submit a Host File and Save Output
+
+Prepare a UTF-8 task file with non-whitespace content and a maximum size of 4 MiB (4,194,304 bytes).
+This redirected-input procedure uses NemoClaw's managed OpenClaw 2026.9.2 parser; do not assume older or custom images accept implicit stdin.
+Replace `my-assistant`, `main`, and `./task.txt` with your sandbox, agent, and host-file path.
+Run the following example as a Bash script from a writable host directory.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+sandbox='my-assistant'
+agent='main'
+task_file='./task.txt'
+output_dir=$(mktemp -d './openclaw-task.XXXXXX')
+printf 'Output directory: %s\n' "$output_dir"
+
+if $$nemoclaw "$sandbox" agent --agent "$agent" --json --timeout 600 \
+  > "$output_dir/result.json" 2> "$output_dir/diagnostics.log" < "$task_file"; then
+  status=0
+else
+  status=$?
+fi
+
+printf '%s\n' "$status" > "$output_dir/exit-status.txt"
+if (( status != 0 )); then
+  printf 'Agent command failed (%s). Inspect %s before retrying.\n' \
+    "$status" "$output_dir" >&2
+  exit "$status"
+fi
+
+printf 'Command exited zero. Verify the task outcome in %s before using results.\n' \
+  "$output_dir"
+```
+
+The host shell opens `task_file` and sends its contents through stdin; no host-file upload path is required.
+Without `-m`, `--message`, or `--message-file`, the managed parser reads non-terminal stdin as the task message.
+A regular file reaches end-of-file (EOF); a pipe producer must finish and close its output.
+Do not add `-m` or `--message` to this example: a recognized inline message takes precedence and NemoClaw closes the child's stdin.
+If you use `--message-file` instead, its path resolves inside the sandbox, not on the host.
+Do not combine `--message` with `--message-file`.
+
+The script creates a fresh host output directory and restricts permissions on newly created files.
+It saves stdout and stderr separately and captures the exit status immediately, including when shell error-exit handling is enabled.
+Do not merge stderr into `result.json` with `2>&1`.
+Saving stdout does not copy files that tools create inside the sandbox.
+The failure branch retains both streams and stops the script before downstream processing.
+
+### Check the Task Outcome
+
+Exit status zero does not prove that the task succeeded.
+An agent can return a success-sounding reply after a tool fails.
+Before consuming the result, perform the following checks:
+
+- Inspect the final response in `result.json`, not only progress records or text inside tool results.
+- Inspect `diagnostics.log` for failed-tool provenance and other errors.
+- Verify child-sourced data when diagnostics mark it as untrusted.
+- Verify the task's expected output or affected resource directly.
+
+Stop automated processing if output is empty, malformed, unexpected, or incomplete.
+NemoClaw preserves captured stdout rather than guaranteeing one clean JSON document or a universal task-success field.
+A nonzero status can accompany useful partial output; keep it for diagnosis, not as a completed result.
+`replayInvalid: true` alone is not always a failure, but it warns that replay can repeat side effects.
+For completion-marker details, refer to the [agent command reference](../../reference/commands#$$nemoclaw-name-agent).
+
+### Troubleshoot Timeouts Before Retrying
+
+Use the diagnostic to distinguish the following timeout conditions:
+
+- Input wait: If a producer keeps stdin open, finish and close it rather than repeatedly resubmitting the task.
+  The managed parser defaults to a 30-second input wait; a positive `--timeout` value also sets that wait in seconds.
+- Agent turn: `--timeout 600` requests a 600-second run deadline.
+  It is not a whole-command wall-clock limit: host readiness is separate, and the dispatch allows additional time for timeout reporting.
+- Provider request: Increasing `--timeout` does not extend `models.providers.<provider-id>.timeoutSeconds`.
+  For existing-sandbox configuration recovery, refer to [Increase the OpenClaw Request Timeout](/user-guide/openclaw/inference/manage-inference/configure-inference-timeouts#increase-the-openclaw-request-timeout).
+
+A timed-out or incomplete turn can leave partial output and already-applied tool side effects.
+Failure does not imply rollback or make an automatic retry safe.
+Inspect the saved diagnostics and locate the affected session before retrying.
+
+```bash
+$$nemoclaw my-assistant sessions list
+```
+
+Replace `<session-key>` with the affected key from the list, then export its transcript.
+
+```bash
+$$nemoclaw my-assistant sessions export <session-key>
+```
+
+Inspect the partial output, exported transcript, and affected resources before deciding whether another run is safe.
+
+</AgentOnly>
+
+<AgentOnly variant="openclaw">
+
 ## Manage the Cloudflare Tunnel
 
 When the host has `cloudflared`, `$$nemoclaw tunnel start` starts a Cloudflare tunnel.
