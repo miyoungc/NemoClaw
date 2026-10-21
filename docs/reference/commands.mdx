@@ -1466,7 +1466,12 @@ When NemoClaw recognizes `-m` or `--message`, it closes the OpenShell child's `s
 This prevents an unused pipe from delaying execution while OpenShell waits for EOF.
 Nonempty `--message-file` arguments and calls without a recognized inline message preserve a pipe or redirect.
 The sandbox resolves message-file paths, including symlinks to stdin.
-For example, the wrapper preserves redirected input for `printf 'ping' | $$nemoclaw my-assistant agent --agent main`.
+For example, pipe a message to the `main` agent:
+
+```bash
+printf 'ping' | $$nemoclaw my-assistant agent --agent main
+```
+
 The producer must close standard input after writing the message.
 The managed OpenClaw parser waits up to 30 seconds for piped input, including `--message-file /dev/stdin` and symlinks to stdin.
 A positive `--timeout <seconds>` sets this input wait as well as the agent turn timeout.
