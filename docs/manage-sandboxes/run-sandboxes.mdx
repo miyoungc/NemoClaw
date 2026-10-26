@@ -224,6 +224,171 @@ If process listing fails on another platform, tunnel start fails closed without 
 If NemoClaw reports incomplete tunnel cleanup, independently verify and stop the recorded cloudflared process with the host process manager, keep the PID record until that process exits, then retry the command.
 </AgentOnly>
 
+<AgentOnly variant="openclaw">
+
+## Run an OpenClaw Task from a Shell Script
+
+Use NemoClaw from a host Bash script to submit a task file, save the response, and check the requested result.
+You need an existing OpenClaw sandbox in the `Ready` or `Running` phase and an available OpenShell executable.
+Confirm readiness with `nemoclaw <sandbox-name> status` before running the script.
+Choose an existing agent ID, or use another target selector: `--session-id`, `--session-key`, or `--to`.
+Run `openclaw agents list` inside the sandbox if you need to find an agent ID.
+The example also requires Node.js on the host for its JSON acceptance check.
+For command options, refer to the [agent command reference](../../reference/commands#$$nemoclaw-name-agent).
+
+### Prepare Host-File Input
+
+Redirect a host file into standard input without `-m`, `--message`, or `--message-file`.
+The host shell reads the file and passes its contents to OpenClaw in the selected sandbox.
+By contrast, `--message-file` names a file inside the sandbox; it does not upload a host file.
+That sandbox file must exist and be readable by the in-sandbox process.
+Relative message-file paths resolve inside the sandbox, not against your host working directory.
+
+This procedure requires the managed OpenClaw parser's implicit-stdin support.
+The checked-in patch targets OpenClaw `2026.9.2`; do not assume older or custom images contain it.
+The managed parser requires nonblank, valid UTF-8 input and limits file or standard-input messages to 4 MiB.
+A finite file supplies end-of-file automatically; a pipe producer must close its output after writing the message.
+An explicit `--message` takes precedence over redirected input, and an empty explicit message fails instead of reading stdin.
+Do not combine `--message` with `--message-file`.
+
+### Save and Check the Result
+
+Keep saved output private: raw stdout and stderr are not redacted, even when NemoClaw sanitizes added provenance diagnostics.
+They can contain sensitive task or tool content.
+The example creates a fresh private directory and retains the task, result, diagnostics, and command status on failure.
+For real tasks, decide how to verify the requested outcome before dispatch; a retry can repeat changes already made.
+
+Save the following script as `run-task.sh` and replace `my-assistant` and `main` with your sandbox name and agent ID.
+
+```bash
+#!/usr/bin/env bash
+set -eu
+umask 077
+
+sandbox='my-assistant'
+agent_id='main'
+out_dir=$(mktemp -d "${TMPDIR:-/tmp}/nemoclaw-task.XXXXXXXX")
+printf 'Saved files: %s\n' "$out_dir"
+printf '%s\n' 'What is 2 + 2? Reply with only 4. Do not use tools.' > "$out_dir/task.txt"
+
+if nemoclaw "$sandbox" agent --agent "$agent_id" --json --timeout 120 \
+    < "$out_dir/task.txt" > "$out_dir/result.json" 2> "$out_dir/diagnostics.log"; then
+  command_status=0
+else
+  command_status=$?
+fi
+printf '%s\n' "$command_status" > "$out_dir/command-status.txt"
+
+if [ "$command_status" -ne 0 ]; then
+  printf 'Command failed with status %s. Inspect saved files before retrying.\n' \
+    "$command_status" >&2
+  exit "$command_status"
+fi
+
+if node - "$out_dir/result.json" <<'NODE'
+const fs = require('node:fs');
+const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+try {
+  const doc = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+  if (!record(doc) || 'event' in doc) throw new Error();
+  let response;
+  if ('result' in doc) {
+    if (doc.status !== 'ok' || 'payloads' in doc || 'meta' in doc) throw new Error();
+    response = doc.result;
+  } else {
+    if ('status' in doc) throw new Error();
+    response = doc;
+  }
+  if (!record(response) || !record(response.meta)) throw new Error();
+  if (response.meta.aborted === true || response.meta.error !== undefined) throw new Error();
+  const payloads = response.payloads;
+  if (!Array.isArray(payloads) || payloads.length !== 1) throw new Error();
+  const reply = payloads[0];
+  if (!record(reply) || reply.isError === true || typeof reply.text !== 'string' ||
+      reply.text.trim() !== '4') throw new Error();
+} catch {
+  console.error('Acceptance check failed: expected one JSON response with one reply containing only 4.');
+  process.exit(1);
+}
+NODE
+then
+  printf 'Acceptance check passed: the reply is 4.\n'
+else
+  printf 'Inspect saved files before retrying.\n' >&2
+  exit 1
+fi
+```
+
+Run the script from your host shell.
+
+```bash
+bash run-task.sh
+```
+
+The script captures the command status immediately, including nonzero status under `set -e`.
+It accepts only status zero plus one reply containing `4`, allowing surrounding whitespace.
+It checks either the gateway response's `result.payloads` or the local response shape's `payloads`; it does not enable `--local` mode.
+Missing, malformed, log-prefixed, ambiguous, or unexpected output fails this acceptance check and remains saved for inspection.
+This check verifies only the arithmetic answer, not completion of an arbitrary task.
+For tasks that change resources, check those resources rather than trusting a success envelope or a nonempty result file.
+
+NemoClaw buffers the dispatched command's stdout and stderr until dispatch completes, so the files are not live progress streams.
+The streams share a 64 MiB capture limit.
+On overflow, NemoClaw reports failure, sends `SIGTERM` to the running OpenShell child, and retains only chunks captured before the overflow.
+The overflowing chunk and subsequent chunks are discarded; the saved result can be partial or invalid JSON.
+With `--json`, NemoClaw preserves captured stdout rather than repairing malformed or log-prefixed output.
+It writes captured stderr and added provenance diagnostics to the diagnostic stream.
+
+Tool-failure diagnostics can accompany exit status zero.
+Recognized incomplete-turn metadata can instead change upstream status zero to status one, after the available trace is written.
+Neither valid JSON nor exit status zero alone proves task success.
+If diagnostics identify untrusted child output, verify that data before using it.
+
+### Inspect Failures Before Retrying
+
+Keep both output files after a failure, including an acceptance-check failure.
+Inspect `diagnostics.log` and `result.json` before changing options.
+For an incomplete or timed-out turn, locate the session key with the following command.
+
+```bash
+nemoclaw <sandbox-name> sessions list
+```
+
+Export the selected session's transcript with its key.
+
+```bash
+nemoclaw <sandbox-name> sessions export <key>
+```
+
+Inspect the transcript and affected resources before another attempt.
+A timeout or abandoned turn does not establish rollback: tool calls can already have applied changes.
+Do not add automatic retries without checking those effects.
+
+### Troubleshoot the Timeout Phase
+
+Identify which wait failed before increasing a deadline.
+The following table distinguishes the input, turn, transport, and provider waits.
+
+| Wait | What to Check |
+| --- | --- |
+| Input | For `Timed out waiting for stdin`, first confirm that the producer closes its output. The managed parser defaults to 30 seconds and uses a finite positive supplied timeout instead, capped at 2,147,483,647 milliseconds. This timer starts in the parser, not before remote dispatch. |
+| Agent turn | Use a positive whole-number `--timeout`, such as the example's `120`. NemoClaw's diagnostic identifies `agents.defaults.timeoutSeconds` as the run deadline and `agent --timeout <seconds>` as its per-run override. |
+| OpenShell execution | NemoClaw requests an execution deadline of the forwarded turn timeout plus 30 seconds. This is not a total wall-clock bound on readiness checks or lock acquisition. |
+| Provider request | When diagnostics report a provider timeout, inspect the deployed provider configuration. NemoClaw's diagnostic identifies `models.providers.<id>.timeoutSeconds` as a separate deadline with no flag override. Increasing `--timeout` is not a general fix for provider failures. |
+
+For a recognized timeout, NemoClaw starts its command budget after readiness and selector checks.
+When pre-dispatch Ollama recovery applies, it shares that budget and reserves one second for dispatch.
+NemoClaw forwards the remaining turn budget rounded up, with a one-second minimum; the OpenShell deadline uses that forwarded value.
+An absent, zero, malformed, or uninterpretable timeout does not request this transport deadline.
+Neither does a timeout after `--` or an unrecognized option, unless NemoClaw already recognized an earlier valid timeout.
+Values outside safe-integer arithmetic also cannot establish the transport bound.
+These cases do not disable independent parser, agent, or provider deadlines.
+
+Check the reported phase and actual sandbox configuration before adjusting a deadline.
+The managed parser and NemoClaw diagnostics describe this implementation, not proof of the parser or provider behavior deployed in your sandbox.
+
+</AgentOnly>
+
 ## Related Topics
 
 - [View Sandbox Status](view-sandbox-status) before changing a sandbox.
